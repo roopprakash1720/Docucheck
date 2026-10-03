@@ -1,0 +1,342 @@
+app:
+  description: "3-agent chained workflow that reviews an agreement, plans its approval, and produces contract intelligence — no external APIs, LLM-only."
+  icon: "📝"
+  icon_background: "#FFEAD5"
+  mode: workflow
+  name: "DocuSign Pain Points - 3 Interconnected Agents"
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+        - .pdf
+        - .docx
+        - .doc
+        - .txt
+      allowed_file_types:
+        - document
+      allowed_file_upload_methods:
+        - local_file
+      enabled: true
+      number_limits: 1
+    opening_statement: ""
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+  graph:
+    edges:
+      - id: edge-start-extract
+        source: start
+        sourceHandle: source
+        target: doc_extractor
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: start
+          targetType: document-extractor
+      - id: edge-extract-agreement
+        source: doc_extractor
+        sourceHandle: source
+        target: llm_agreement
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: document-extractor
+          targetType: llm
+      - id: edge-agreement-approval
+        source: llm_agreement
+        sourceHandle: source
+        target: llm_approval
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: llm
+          targetType: llm
+      - id: edge-approval-contract
+        source: llm_approval
+        sourceHandle: source
+        target: llm_contract
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: llm
+          targetType: llm
+      - id: edge-contract-template
+        source: llm_contract
+        sourceHandle: source
+        target: template_final
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: llm
+          targetType: template-transform
+      - id: edge-template-end
+        source: template_final
+        sourceHandle: source
+        target: end
+        targetHandle: target
+        type: custom
+        data:
+          sourceType: template-transform
+          targetType: end
+    nodes:
+      # ------------------------------------------------------------------
+      # START — collects the contract file and (optional) approval log
+      # ------------------------------------------------------------------
+      - id: start
+        type: custom
+        position: { x: 0, y: 300 }
+        data:
+          type: start
+          title: User Input
+          desc: "Contract to review + optional approval history typed/pasted by the user"
+          variables:
+            - variable: contract_document
+              label: "Contract / Agreement (PDF, DOCX or TXT)"
+              type: file
+              required: true
+              allowed_file_types: [document]
+              allowed_file_upload_methods: [local_file]
+            - variable: approval_workflow_data
+              label: "Approval history (optional, free text or CSV pasted in) e.g. 'Legal - Pending - 4 Days, Finance - Approved, CEO - Pending - 2 Days'"
+              type: paragraph
+              required: false
+
+      # ------------------------------------------------------------------
+      # DOCUMENT EXTRACTOR — turns the uploaded file into plain text
+      # (no external OCR/API — Dify's built-in extractor node)
+      # ------------------------------------------------------------------
+      - id: doc_extractor
+        type: custom
+        position: { x: 300, y: 300 }
+        data:
+          type: document-extractor
+          title: Extract Contract Text
+          desc: "Converts the uploaded PDF/DOCX into raw text for the agents"
+          variable_selector: ["start", "contract_document"]
+          is_array_file: false
+
+      # ------------------------------------------------------------------
+      # AGENT 1 — Agreement Review Agent (Document pain point)
+      # ------------------------------------------------------------------
+      - id: llm_agreement
+        type: custom
+        position: { x: 600, y: 100 }
+        data:
+          type: llm
+          title: "Agent 1 · Agreement Review Agent"
+          desc: "Checks the document is ready to be sent for signature"
+          model:
+            provider: anthropic
+            name: claude-sonnet-4-5
+            mode: chat
+            completion_params:
+              temperature: 0.2
+              max_tokens: 1200
+          context:
+            enabled: false
+          vision:
+            enabled: false
+          prompt_template:
+            - role: system
+              text: >
+                You are a legal document validator (Agreement Review Agent).
+                Read the contract text provided and identify:
+                - Missing or blank signature fields
+                - Missing dates, names, or other required fields
+                - Wrong or missing signer order
+                - Inconsistent formatting
+                - Any mandatory clauses that appear to be missing (confidentiality,
+                  governing law, termination, etc.)
+
+                Respond ONLY in this exact structure so downstream agents can parse it:
+
+                Document Readiness Score: <0-100>%
+                Missing Fields:
+                - <item>
+                Compliance Issues:
+                - <item>
+                Status: <"Ready for Approval" or "Needs Correction Before Approval">
+            - role: user
+              text: |
+                Here is the contract text to review:
+
+                {{#doc_extractor.text#}}
+          output_variable: text
+
+      # ------------------------------------------------------------------
+      # AGENT 2 — Approval Intelligence Agent (Approval-delay pain point)
+      # Takes Agent 1's report + the user-supplied approval log as input
+      # ------------------------------------------------------------------
+      - id: llm_approval
+        type: custom
+        position: { x: 900, y: 300 }
+        data:
+          type: llm
+          title: "Agent 2 · Approval Intelligence Agent"
+          desc: "Builds an approval plan using Agent 1's findings + approval history"
+          model:
+            provider: openai
+            name: gpt-4o-mini
+            mode: chat
+            completion_params:
+              temperature: 0.3
+              max_tokens: 1000
+          context:
+            enabled: false
+          vision:
+            enabled: false
+          prompt_template:
+            - role: system
+              text: >
+                You are an approval-workflow analyst (Approval Intelligence Agent).
+                You never call any external system — you only reason over the text given to you.
+
+                Using the Agreement Review report and the (optional) approval history log,
+                identify bottlenecks, predict delay, recommend a faster approval sequence
+                (e.g. running two approvers in parallel), and draft one short reminder message
+                for whichever approver is the current bottleneck.
+
+                If no approval history was supplied, say so and give generic best-practice
+                recommendations based only on the document's readiness status.
+
+                Respond ONLY in this exact structure:
+
+                Approval Health Score: <0-100>%
+                Bottleneck: <department/person or "None identified">
+                Estimated Delay: <e.g. "4 days">
+                Recommendation: <parallelization or process suggestion>
+                Estimated Time Saved: <e.g. "2 days">
+                Draft Reminder Message: <short message>
+            - role: user
+              text: |
+                Agreement Review Agent report:
+                {{#llm_agreement.text#}}
+
+                Approval history provided by the user (may be empty):
+                {{#start.approval_workflow_data#}}
+          output_variable: text
+
+      # ------------------------------------------------------------------
+      # AGENT 3 — Contract Intelligence Agent (Contract-understanding pain point)
+      # Takes original text + Agent 1 + Agent 2 outputs
+      # ------------------------------------------------------------------
+      - id: llm_contract
+        type: custom
+        position: { x: 1200, y: 100 }
+        data:
+          type: llm
+          title: "Agent 3 · Contract Intelligence Agent"
+          desc: "Extracts clauses, scores risk, and writes the executive summary"
+          model:
+            provider: anthropic
+            name: claude-sonnet-4-5
+            mode: chat
+            completion_params:
+              temperature: 0.2
+              max_tokens: 1500
+          context:
+            enabled: false
+          vision:
+            enabled: false
+          prompt_template:
+            - role: system
+              text: >
+                You are a contract intelligence analyst (Contract Intelligence Agent).
+                You have the full contract text plus the reports from the two earlier agents.
+
+                Tasks:
+                1. Extract key clauses: payment, termination, liability, renewal,
+                   confidentiality, warranty, governing law (whichever are present).
+                2. Identify high-risk terms (e.g. unlimited liability, automatic renewal,
+                   one-sided indemnity, missing data-privacy language) and give a
+                   Contract Risk Score from 0-100 (higher = riskier).
+                3. Write a one-page executive summary: purpose, key obligations,
+                   financial commitments, renewal/termination dates.
+                4. Combine your findings with the Document Readiness and Approval Health
+                   scores you were given into ONE final numbered action list.
+
+                Respond ONLY in this exact structure:
+
+                Contract Summary:
+                Purpose: <text>
+                Key Clauses: <bullet list>
+                High Risk Items: <bullet list>
+                Risk Score: <0-100>/100
+
+                Combined Scorecard:
+                Document Readiness: <copy from Agent 1>
+                Approval Health: <copy from Agent 2>
+                Contract Risk: <score>/100
+
+                Recommended Actions:
+                1. <action>
+                2. <action>
+                3. <action>
+            - role: user
+              text: |
+                Full contract text:
+                {{#doc_extractor.text#}}
+
+                Agreement Review Agent report:
+                {{#llm_agreement.text#}}
+
+                Approval Intelligence Agent report:
+                {{#llm_approval.text#}}
+          output_variable: text
+
+      # ------------------------------------------------------------------
+      # TEMPLATE TRANSFORM — merges all three agent outputs into one report
+      # (pure string templating, no API calls)
+      # ------------------------------------------------------------------
+      - id: template_final
+        type: custom
+        position: { x: 1500, y: 300 }
+        data:
+          type: template-transform
+          title: Final Business Report
+          template: |
+            ===================================================
+             DOCUSIGN PAIN-POINT REPORT (Document · Approval · Contract)
+            ===================================================
+
+            --- AGENT 1: AGREEMENT REVIEW -----------------------
+            {{ agreement }}
+
+            --- AGENT 2: APPROVAL INTELLIGENCE ------------------
+            {{ approval }}
+
+            --- AGENT 3: CONTRACT INTELLIGENCE ------------------
+            {{ contract }}
+          variables:
+            - variable: agreement
+              value_selector: ["llm_agreement", "text"]
+            - variable: approval
+              value_selector: ["llm_approval", "text"]
+            - variable: contract
+              value_selector: ["llm_contract", "text"]
+
+      # ------------------------------------------------------------------
+      # END
+      # ------------------------------------------------------------------
+      - id: end
+        type: custom
+        position: { x: 1800, y: 300 }
+        data:
+          type: end
+          title: End
+          outputs:
+            - variable: final_report
+              value_selector: ["template_final", "output"]
